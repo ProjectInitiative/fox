@@ -129,6 +129,21 @@ pub fn get_ram_info() -> RamInfo {
     }
 }
 
+/// Read total system RAM from /proc/meminfo (Linux, returns bytes).
+fn system_ram_total() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if line.starts_with("MemTotal:") {
+            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Minimum sane GPU memory (1 GiB). Values below this are ignored as detection failures.
+const MIN_GPU_BYTES: usize = 1 * 1024 * 1024 * 1024;
+
 /// Query total GPU memory via nvidia-smi or rocm-smi.
 /// Falls back to total system RAM (for HIP UMA / CPU) then 8 GiB.
 /// If FOX_GPU_MEMORY_BYTES env var is set, it takes precedence (manual
@@ -167,10 +182,17 @@ fn query_rocm_memory_bytes() -> Option<Vec<usize>> {
         .filter_map(|v| v.trim().parse::<usize>().ok())
         .collect();
     if gpus.is_empty() {
-        None
-    } else {
-        Some(gpus)
+        return None;
     }
+    for &bytes in &gpus {
+        if bytes < MIN_GPU_BYTES {
+            tracing::warn!(
+                "rocm-smi reported only {} MiB for GPU — ignoring, will use fallback",
+                bytes / (1024 * 1024),
+            );
+        }
+    }
+    Some(gpus)
 }
 
 /// Query memory for all available GPUs via nvidia-smi or rocm-smi.

@@ -19,8 +19,7 @@ use crate::api::shared::inference::{
 use crate::api::shared::streaming::finish_reason_str;
 use crate::api::types::{
     ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionRequest,
-    ChatCompletionResponse, ChatMessageDelta, ChatMessageResponse, ToolCallDelta,
-    ToolCallFunctionDelta, Usage,
+    ChatCompletionResponse, ChatMessageDelta, ChatMessageResponse, Usage,
 };
 use crate::scheduler::{InferenceRequest, SamplingParams, Token};
 
