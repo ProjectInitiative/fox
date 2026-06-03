@@ -66,13 +66,27 @@ impl InferenceEngine {
             if !prefill_ids.is_empty() {
                 // Count actual prompt tokens being prefilled (minus prefix-cached tokens)
                 let prompts = engine.scheduler.get_running(&prefill_ids);
-                for p in &prompts {
-                    stats_tokens_prefill += (p.prompt_tokens.len() - p.skip_prefix_tokens) as u64;
-                }
+                let batch_prefill_tokens: u64 = prompts
+                    .iter()
+                    .map(|p| (p.prompt_tokens.len() - p.skip_prefix_tokens) as u64)
+                    .sum();
+                stats_tokens_prefill += batch_prefill_tokens;
                 let prefill_start = Instant::now();
                 match engine.run_prefill(&prefill_ids).await {
                     Ok(prefill_results) => {
-                        stats_time_prefill += prefill_start.elapsed().as_secs_f64();
+                        let elapsed = prefill_start.elapsed().as_secs_f64();
+                        stats_time_prefill += elapsed;
+                        let pp_s = if elapsed > 0.0 {
+                            batch_prefill_tokens as f64 / elapsed
+                        } else {
+                            0.0
+                        };
+                        tracing::info!(
+                            "prefill: {} tokens, {:.1}ms, {:.0} t/s",
+                            batch_prefill_tokens,
+                            elapsed * 1000.0,
+                            pp_s,
+                        );
                         engine.handle_logits(&prefill_results, true).await?;
                     }
                     Err(e) => {
