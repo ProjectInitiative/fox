@@ -12,7 +12,7 @@ services:
       FOX_HOST: 0.0.0.0
       FOX_PORT: "8080"
       FOX_GPU_MEMORY_FRACTION: "0.95"
-      # FOX_GPU_MEMORY_BYTES: "68719476736"  # overrides auto-detection (e.g. 64 GiB)
+      FOX_GPU_MEMORY_BYTES: "131014504448"  # 122 GiB override (rocm-smi broken in Docker)
       FOX_MAX_BATCH_SIZE: "16"
       FOX_MAX_CONTEXT_LEN: "262144"
 
