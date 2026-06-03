@@ -130,15 +130,12 @@ pub fn get_ram_info() -> RamInfo {
 }
 
 /// Query total GPU memory via nvidia-smi or rocm-smi.
-/// Falls back to total system RAM if no GPU tool is available (e.g. HIP UMA).
-/// Returns only the first GPU's memory (used for single-GPU budget calculations).
+/// Falls back to 8 GiB if no GPU tool is available (conservative for non-UMA).
 pub fn get_gpu_memory_bytes() -> usize {
-    let from_gpu = get_all_gpu_memory_bytes();
-    if let Some(bytes) = from_gpu.into_iter().next() {
-        return bytes;
-    }
-    // No GPU tool found — use system RAM total (covers HIP UMA / CPU fallback).
-    system_ram_total().unwrap_or(8 * 1024 * 1024 * 1024)
+    get_all_gpu_memory_bytes()
+        .into_iter()
+        .next()
+        .unwrap_or(8 * 1024 * 1024 * 1024)
 }
 
 /// Query total GPU memory via rocm-smi for AMD GPUs.
@@ -200,23 +197,11 @@ pub fn get_all_gpu_memory_bytes() -> Vec<usize> {
     vec![]
 }
 
-/// Read total system RAM from /proc/meminfo (Linux).
-fn system_ram_total() -> Option<usize> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        if line.starts_with("MemTotal:") {
-            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
-/// Sum of memory across all GPUs. Falls back to system RAM total if no GPU is found.
+/// Sum of memory across all GPUs. Falls back to 8 GiB if no GPU is found.
 pub fn get_total_gpu_memory_bytes() -> usize {
     let gpus = get_all_gpu_memory_bytes();
     if gpus.is_empty() {
-        system_ram_total().unwrap_or(8 * 1024 * 1024 * 1024)
+        8 * 1024 * 1024 * 1024
     } else {
         gpus.iter().sum()
     }
