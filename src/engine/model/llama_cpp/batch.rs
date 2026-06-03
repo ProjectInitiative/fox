@@ -66,48 +66,88 @@ impl LlamaCppModel {
         // total_tokens ≥ 1 because effective_skip < prompt_tokens.len() for any non-empty prompt.
         let n_seq_max = requests.len().max(1) as i32;
 
-        let mut batch = unsafe { ffi::llama_batch_init(total_tokens as i32, 0, n_seq_max) };
-
-        let mut batch_logits_indices: Vec<i32> = Vec::with_capacity(requests.len());
+        // Pre-compute batch entries so we can process them in chunks with live progress.
+        struct BatchEntry {
+            token: i32,
+            pos: i32,
+            seq_id: i32,
+            has_logits: bool,
+        }
+        let mut entries: Vec<BatchEntry> = Vec::with_capacity(total_tokens);
 
         for req in requests.iter() {
             let seq_id = req.kv_seq_id;
             let start = effective_skip(req);
             let tokens_to_submit = &req.prompt_tokens[start..];
-            if tokens_to_submit.is_empty() {
-                // Should be handled by the total_tokens == 0 branch above, but be defensive.
-                batch_logits_indices.push(-1);
-                continue;
-            }
             for (local_pos, &token) in tokens_to_submit.iter().enumerate() {
                 let abs_pos = start + local_pos;
-                let idx = batch.n_tokens as usize;
-                let has_logits = abs_pos == req.prompt_tokens.len() - 1;
-                unsafe {
-                    *batch.token.add(idx) = token;
-                    *batch.pos.add(idx) = abs_pos as i32;
-                    *batch.n_seq_id.add(idx) = 1;
-                    let arr = *batch.seq_id.add(idx);
-                    *arr.add(0) = seq_id;
-                    *batch.logits.add(idx) = if has_logits { 1i8 } else { 0i8 };
-                }
-                batch.n_tokens += 1;
-                if has_logits {
-                    batch_logits_indices.push(idx as i32);
-                }
+                entries.push(BatchEntry {
+                    token,
+                    pos: abs_pos as i32,
+                    seq_id,
+                    has_logits: abs_pos == req.prompt_tokens.len() - 1,
+                });
             }
         }
 
+        let prefill_start = std::time::Instant::now();
         let ctx_guard = self
             ._ctx
             .lock()
             .map_err(|e| anyhow!("lock poisoned: {}", e))?;
         let ctx = ctx_guard.as_ptr();
 
-        let ret = unsafe { ffi::llama_decode(ctx, batch) };
-        if ret != 0 {
+        const CHUNK_SIZE: usize = 4096;
+        let mut processed: usize = 0;
+        let mut batch_logits_indices: Vec<i32> = Vec::with_capacity(requests.len());
+
+        while processed < entries.len() {
+            let chunk_end = (processed + CHUNK_SIZE).min(entries.len());
+            let chunk = &entries[processed..chunk_end];
+            let is_last = chunk_end == entries.len();
+            let n_tokens = chunk.len();
+
+            let mut batch = unsafe { ffi::llama_batch_init(n_tokens as i32, 0, n_seq_max) };
+
+            for (local_i, entry) in chunk.iter().enumerate() {
+                let has_logits = entry.has_logits && is_last;
+                unsafe {
+                    *batch.token.add(local_i) = entry.token;
+                    *batch.pos.add(local_i) = entry.pos;
+                    *batch.n_seq_id.add(local_i) = 1;
+                    let arr = *batch.seq_id.add(local_i);
+                    *arr.add(0) = entry.seq_id;
+                    *batch.logits.add(local_i) = if has_logits { 1i8 } else { 0i8 };
+                }
+                batch.n_tokens += 1;
+                if has_logits {
+                    batch_logits_indices.push(local_i as i32);
+                }
+            }
+
+            let ret = unsafe { ffi::llama_decode(ctx, batch) };
             unsafe { ffi::llama_batch_free(batch) };
-            return Err(anyhow!("llama_decode failed: {}", ret));
+            if ret != 0 {
+                return Err(anyhow!("llama_decode failed: {}", ret));
+            }
+
+            if !is_last {
+                let elapsed = prefill_start.elapsed().as_secs_f64();
+                let chunk_pp_s = if elapsed > 0.0 {
+                    chunk_end as f64 / elapsed
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    "prefill: {}/{} tokens, {:.0} t/s, {:.0}s",
+                    chunk_end,
+                    entries.len(),
+                    chunk_pp_s,
+                    elapsed,
+                );
+            }
+
+            processed = chunk_end;
         }
 
         let n_vocab = self.config.vocab_size as i32;
@@ -151,7 +191,6 @@ impl LlamaCppModel {
             results.push((req_id, Logits::new(values, sampled), tokens_in_kv));
         }
 
-        unsafe { ffi::llama_batch_free(batch) };
         Ok(results)
     }
 
