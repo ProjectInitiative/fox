@@ -146,7 +146,15 @@ const MIN_GPU_BYTES: usize = 1 * 1024 * 1024 * 1024;
 
 /// Query total GPU memory via nvidia-smi or rocm-smi.
 /// Falls back to total system RAM (for HIP UMA / CPU) then 8 GiB.
+/// If FOX_GPU_MEMORY_BYTES env var is set, it takes precedence (avoids
+/// broken detection inside Docker/ROCm containers).
 pub fn get_gpu_memory_bytes() -> usize {
+    // FOX_GPU_MEMORY_BYTES overrides everything (manual override for Docker).
+    if let Ok(val) = std::env::var("FOX_GPU_MEMORY_BYTES") {
+        if let Ok(bytes) = val.parse::<usize>() {
+            return bytes;
+        }
+    }
     let from_gpu = get_all_gpu_memory_bytes();
     for gpu in &from_gpu {
         if *gpu >= MIN_GPU_BYTES {
@@ -226,7 +234,14 @@ pub fn get_all_gpu_memory_bytes() -> Vec<usize> {
 }
 
 /// Sum of memory across all GPUs. Falls back to system RAM then 8 GiB.
+/// FOX_GPU_MEMORY_BYTES env var overrides auto-detection.
 pub fn get_total_gpu_memory_bytes() -> usize {
+    if let Ok(val) = std::env::var("FOX_GPU_MEMORY_BYTES") {
+        if let Ok(bytes) = val.parse::<usize>() {
+            // When set, treat as total across all GPUs for multi-GPU split budgets.
+            return bytes;
+        }
+    }
     let gpus = get_all_gpu_memory_bytes();
     let sane_total: usize = gpus.iter().filter(|&&b| b >= MIN_GPU_BYTES).sum();
     if sane_total > 0 {
