@@ -112,33 +112,41 @@ pub(crate) fn apply_output_filter(state: &mut PerRequestState, raw: &str) -> (St
 
     // 2. Exit <think> block.  Check both the current token and the accumulated
     //    thinking buffer, because `</think>` can span multiple BPE tokens
-    //    (e.g. `</` + `think` + `>`).
-    let combined = if state.in_thinking && !state.thinking_buf.is_empty() {
-        let mut c = std::mem::take(&mut state.thinking_buf);
-        c.push_str(raw);
-        c
-    } else {
-        raw.to_string()
-    };
-    if let Some(end_idx) = combined.find("</think>") {
-        state.in_thinking = false;
-        state.thinking_buf.clear();
-        let after_tag = end_idx + "</think>".len();
-        let tail = &combined[after_tag..];
-        if state.show_thinking {
-            let mut out = combined[..after_tag].to_string();
+    //    (e.g. `</` + `think` + `>`).  We peek into the buffer WITHOUT taking it,
+    //    so step 3 can continue appending if `</think>` is not found yet.
+    if state.in_thinking {
+        let combined_len = state.thinking_buf.len() + raw.len();
+        let mut combined = String::with_capacity(combined_len);
+        combined.push_str(&state.thinking_buf);
+        combined.push_str(raw);
+        if let Some(end_idx) = combined.find("</think>") {
+            state.in_thinking = false;
+            state.thinking_buf.clear();
+            let after_tag = end_idx + "</think>".len();
+            let tail = &combined[after_tag..];
+            if state.show_thinking {
+                let mut out = combined[..after_tag].to_string();
+                if !tail.is_empty() {
+                    state.pending_output.push_str(tail);
+                    let (rest, stop) = flush_pending_output(&mut state.pending_output, &patterns);
+                    out.push_str(&rest);
+                    if stop {
+                        return (out, true);
+                    }
+                }
+                return (out, false);
+            }
             if !tail.is_empty() {
                 state.pending_output.push_str(tail);
-                let (rest, stop) = flush_pending_output(&mut state.pending_output, &patterns);
-                out.push_str(&rest);
-                if stop {
-                    return (out, true);
-                }
             }
-            return (out, false);
+            return flush_pending_output(&mut state.pending_output, &patterns);
         }
-        if !tail.is_empty() {
-            state.pending_output.push_str(tail);
+        // Not found yet — fall through to step 3 to accumulate raw.
+    } else if let Some(end_idx) = raw.find("</think>") {
+        // Not in thinking mode but raw contains </think> — unusual but handle it.
+        let after_tag = end_idx + "</think>".len();
+        if after_tag < raw.len() {
+            state.pending_output.push_str(&raw[after_tag..]);
         }
         return flush_pending_output(&mut state.pending_output, &patterns);
     }
