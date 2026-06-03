@@ -97,7 +97,7 @@ impl LlamaCppModel {
             .map_err(|e| anyhow!("lock poisoned: {}", e))?;
         let ctx = ctx_guard.as_ptr();
 
-        const CHUNK_SIZE: usize = 4096;
+        const CHUNK_SIZE: usize = 2048;
         let mut processed: usize = 0;
         let mut batch_logits_indices: Vec<i32> = Vec::with_capacity(requests.len());
 
