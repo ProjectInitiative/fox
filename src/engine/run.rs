@@ -72,7 +72,29 @@ impl InferenceEngine {
                     .sum();
                 stats_tokens_prefill += batch_prefill_tokens;
                 let prefill_start = Instant::now();
-                match engine.run_prefill(&prefill_ids).await {
+                let prefill_result = {
+                    let prefill_fut = engine.run_prefill(&prefill_ids);
+                    tokio::pin!(prefill_fut);
+                    let mut progress_timer = tokio::time::sleep(std::time::Duration::from_secs(5));
+                    tokio::pin!(progress_timer);
+                    loop {
+                        tokio::select! {
+                            result = &mut prefill_fut => break result,
+                            _ = &mut progress_timer => {
+                                let elapsed = prefill_start.elapsed().as_secs_f64();
+                                tracing::info!(
+                                    "prefill: {} tokens, {:.0}s elapsed, continuing...",
+                                    batch_prefill_tokens,
+                                    elapsed,
+                                );
+                                progress_timer
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+                            }
+                        }
+                    }
+                };
+                match prefill_result {
                     Ok(prefill_results) => {
                         let elapsed = prefill_start.elapsed().as_secs_f64();
                         stats_time_prefill += elapsed;
