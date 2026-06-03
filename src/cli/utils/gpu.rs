@@ -129,27 +129,11 @@ pub fn get_ram_info() -> RamInfo {
     }
 }
 
-/// Read total system RAM from /proc/meminfo (Linux, returns bytes).
-fn system_ram_total() -> Option<usize> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        if line.starts_with("MemTotal:") {
-            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
-
-/// Minimum sane GPU memory (1 GiB). Values below this are ignored as detection failures.
-const MIN_GPU_BYTES: usize = 1 * 1024 * 1024 * 1024;
-
 /// Query total GPU memory via nvidia-smi or rocm-smi.
 /// Falls back to total system RAM (for HIP UMA / CPU) then 8 GiB.
-/// If FOX_GPU_MEMORY_BYTES env var is set, it takes precedence (avoids
-/// broken detection inside Docker/ROCm containers).
+/// If FOX_GPU_MEMORY_BYTES env var is set, it takes precedence (manual
+/// Docker override for when rocm-smi is broken inside containers).
 pub fn get_gpu_memory_bytes() -> usize {
-    // FOX_GPU_MEMORY_BYTES overrides everything (manual override for Docker).
     if let Ok(val) = std::env::var("FOX_GPU_MEMORY_BYTES") {
         if let Ok(bytes) = val.parse::<usize>() {
             return bytes;
@@ -183,19 +167,10 @@ fn query_rocm_memory_bytes() -> Option<Vec<usize>> {
         .filter_map(|v| v.trim().parse::<usize>().ok())
         .collect();
     if gpus.is_empty() {
-        return None;
+        None
+    } else {
+        Some(gpus)
     }
-    // Log what rocm-smi reports so we can diagnose bogus values (e.g. 0.5 GiB).
-    for (i, &bytes) in gpus.iter().enumerate() {
-        if bytes < MIN_GPU_BYTES {
-            tracing::warn!(
-                "rocm-smi reported only {} MiB for GPU {} — ignoring, will use fallback",
-                bytes / (1024 * 1024),
-                i,
-            );
-        }
-    }
-    Some(gpus)
 }
 
 /// Query memory for all available GPUs via nvidia-smi or rocm-smi.
@@ -233,12 +208,11 @@ pub fn get_all_gpu_memory_bytes() -> Vec<usize> {
     vec![]
 }
 
-/// Sum of memory across all GPUs. Falls back to system RAM then 8 GiB.
+/// Sum of memory across all GPUs. Falls back to 8 GiB if no GPU is found.
 /// FOX_GPU_MEMORY_BYTES env var overrides auto-detection.
 pub fn get_total_gpu_memory_bytes() -> usize {
     if let Ok(val) = std::env::var("FOX_GPU_MEMORY_BYTES") {
         if let Ok(bytes) = val.parse::<usize>() {
-            // When set, treat as total across all GPUs for multi-GPU split budgets.
             return bytes;
         }
     }
@@ -247,6 +221,5 @@ pub fn get_total_gpu_memory_bytes() -> usize {
     if sane_total > 0 {
         return sane_total;
     }
-    // No sane GPU values — try system RAM (HIP UMA / CPU-only).
     system_ram_total().unwrap_or(8 * 1024 * 1024 * 1024)
 }
