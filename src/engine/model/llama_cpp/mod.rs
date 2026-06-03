@@ -365,6 +365,12 @@ impl LlamaCppModel {
             .or_else(available_ram_bytes)
             .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
+        tracing::info!(
+            "memory budget: free={:.1} GiB, fraction={}, budget={:.1} GiB",
+            free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            gpu_memory_fraction,
+            budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
         // bytes_per_token = 2 (K+V) * n_head_kv * head_dim * 2 (fp16) * n_layer
         let bytes_per_token = 2 * n_head_kv * head_dim * 2 * n_layer;
         let max_tokens_by_mem = if bytes_per_token > 0 && budget_bytes > 0 {
