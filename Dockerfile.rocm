@@ -1,0 +1,110 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 1: builder
+# Builds fox with ROCm/HIP GPU backend for AMD GPUs.
+# Uses Fedora + ROCm repositories for the HIP toolchain.
+# ──────────────────────────────────────────────────────────────────────────────
+FROM registry.fedoraproject.org/fedora:43 AS builder
+
+# ROCm 7.2.4 repository
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[ROCm-7.2.4]
+name=ROCm7.2.4
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.4/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+REPO
+EOF
+
+# Build dependencies: ROCm devel + Rust + cmake/clang
+RUN dnf -y --nodocs --setopt=install_weak_deps=False \
+  --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+  install \
+  make gcc cmake lld clang clang-devel compiler-rt ninja-build \
+  rocm-llvm rocm-device-libs hip-runtime-amd hip-devel \
+  rocblas rocblas-devel hipblas hipblas-devel rocm-cmake libomp-devel libomp \
+  rocminfo \
+  git-core curl \
+  && dnf clean all && rm -rf /var/cache/dnf/*
+
+# ROCm environment — build.rs detects HIP via HIPCC env var
+ENV ROCM_PATH=/opt/rocm \
+  HIP_PATH=/opt/rocm \
+  HIP_CLANG_PATH=/opt/rocm/llvm/bin \
+  HIPCC=/opt/rocm/bin/hipcc \
+  PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH
+
+# Extra cmake flags for AMD GPU tuning
+ENV FOX_CMAKE_ARGS="-DAMDGPU_TARGETS=gfx1151 -DLLAMA_HIP_UMA=ON -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=ON"
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:$PATH"
+
+WORKDIR /app
+
+# Fetch dependencies first (cached layer)
+COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    cargo fetch
+
+# Build
+COPY . .
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin fox --bin fox-bench && \
+    mkdir -p /bundle && \
+    cp target/release/fox target/release/fox-bench /bundle/ && \
+    find target/release -maxdepth 1 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) \
+         -exec cp {} /bundle/ \;
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 2: runtime image
+# Minimal image with ROCm runtime libraries and fox binaries.
+# The HIP backend (.so) is loaded at runtime via dlopen — no hard GPU dep.
+# ──────────────────────────────────────────────────────────────────────────────
+FROM registry.fedoraproject.org/fedora-minimal:43
+
+# ROCm 7.2.4 repository
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[ROCm-7.2.4]
+name=ROCm7.2.4
+baseurl=https://repo.radeon.com/rocm/rhel10/7.2.4/main
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+REPO
+EOF
+
+# Runtime dependencies
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 \
+  --exclude='*sdk*' --exclude='*samples*' --exclude='*-doc*' --exclude='*-docs*' \
+  install \
+  bash ca-certificates libatomic libstdc++ libgcc libgomp sudo \
+  hip-runtime-amd rocblas hipblas \
+  rocminfo procps-ng \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+# Copy fox binaries and backend shared libraries
+COPY --from=builder /bundle/ /usr/local/lib/fox/
+
+# Register backend library directory and create SONAME symlinks
+RUN echo "/usr/local/lib/fox" > /etc/ld.so.conf.d/fox.conf && ldconfig
+
+# Wrappers so fox/fox-bench are on PATH
+RUN ln -s /usr/local/lib/fox/fox      /usr/local/bin/fox && \
+    ln -s /usr/local/lib/fox/fox-bench /usr/local/bin/fox-bench
+
+ENV FOX_HOST=0.0.0.0
+ENV FOX_PORT=8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["fox"]
+CMD ["serve"]

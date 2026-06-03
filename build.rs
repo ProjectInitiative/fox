@@ -210,6 +210,21 @@ fn main() {
         }
     }
 
+    // ── FOX_CMAKE_ARGS (extra cmake defines from environment) ──────────────
+    // Usage: FOX_CMAKE_ARGS="-DAMDGPU_TARGETS=gfx1151 -DLLAMA_HIP_UMA=ON"
+    for arg in env::var("FOX_CMAKE_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+    {
+        if arg.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = arg.trim_start_matches("-D").split_once('=') {
+            println!("cargo:warning=FOX_CMAKE_ARGS: {key}={value}");
+            cmake_config.define(key, value);
+        }
+    }
+
     // ── build ─────────────────────────────────────────────────────────────────
     let dst = cmake_config.build();
     let build_dir = dst.join("build");

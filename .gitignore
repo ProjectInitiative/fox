@@ -30,3 +30,15 @@ Thumbs.db
 *.log
 
 .lab
+
+# Nix / Direnv / Devenv
+.direnv/
+.devenv/
+.devenv.flake.nix
+result
+
+# Pre-commit (auto-generated)
+.pre-commit-config.yaml
+
+# Reference repos
+ref/

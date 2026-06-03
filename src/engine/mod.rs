@@ -121,6 +121,10 @@ impl InferenceEngine {
         self.model.recommended_sampling()
     }
 
+    pub fn template_supports_tool_role(&self) -> bool {
+        self.model.template_supports_tool_role()
+    }
+
     pub fn kv_cache_usage(&self) -> f32 {
         self.kv_cache.memory_usage()
     }

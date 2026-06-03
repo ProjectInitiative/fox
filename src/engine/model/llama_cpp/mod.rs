@@ -39,19 +39,46 @@ use crate::engine::model::{InferenceRequestForModel, Logits, Model, ModelConfig}
 #[cfg(not(fox_stub))]
 pub(super) const SPM_SPACE: char = '\u{2581}';
 
-/// Query current free GPU memory in bytes via nvidia-smi.
-/// Returns None on CPU-only systems or when nvidia-smi is unavailable.
+/// Query current free GPU memory in bytes via nvidia-smi or rocm-smi.
+/// Returns None on CPU-only systems or when no GPU tool is available.
 #[cfg(not(fox_stub))]
 fn query_gpu_free_bytes() -> Option<usize> {
-    let out = std::process::Command::new("nvidia-smi")
+    // 1. Try nvidia-smi (NVIDIA GPUs)
+    if let Ok(nvidia_out) = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    {
+        if nvidia_out.status.success() {
+            if let Ok(s) = std::str::from_utf8(&nvidia_out.stdout) {
+                if let Ok(mib) = s.trim().parse::<usize>() {
+                    return Some(mib * 1024 * 1024);
+                }
+            }
+        }
     }
-    let mib: usize = std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()?;
-    Some(mib * 1024 * 1024)
+
+    // 2. Try rocm-smi (AMD ROCm GPUs) — reports free VRAM in bytes
+    if let Ok(rocm_out) = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram"])
+        .output()
+    {
+        if rocm_out.status.success() {
+            if let Ok(s) = std::str::from_utf8(&rocm_out.stdout) {
+                // rocm-smi output: "GPU[0]    : VRAM Free Memory (B): 34359738368"
+                for line in s.lines() {
+                    if line.contains("VRAM Free Memory") {
+                        if let Some(val) = line.split(':').last() {
+                            if let Ok(bytes) = val.trim().parse::<usize>() {
+                                return Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Read available system RAM in bytes from /proc/meminfo (Linux).
@@ -170,6 +197,8 @@ pub struct LlamaCppModel {
     /// Whether this instance owns the model pointer and should free it on drop.
     /// `false` when sharing weights with another `LlamaCppModel` (e.g. bench-kv).
     owns_model: bool,
+    /// Whether the model's Jinja2 chat template handles the "tool" role natively.
+    pub(super) supports_tool_role: bool,
 }
 
 #[cfg(not(fox_stub))]
@@ -330,8 +359,9 @@ impl LlamaCppModel {
 
         // Cap total KV context to fit in available GPU (or RAM) memory.
         // Query FREE memory now (after model weights are loaded) so we don't OOM.
-        // Falls back to gpu_memory_bytes * fraction if nvidia-smi is unavailable.
+        // Tries nvidia-smi, then rocm-smi, then system RAM (for HIP UMA / CPU).
         let free_bytes = query_gpu_free_bytes()
+            .or_else(available_ram_bytes)
             .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
         // bytes_per_token = 2 (K+V) * n_head_kv * head_dim * 2 (fp16) * n_layer
@@ -342,9 +372,13 @@ impl LlamaCppModel {
             effective_max_ctx * n_seq
         };
         // Honour the effective_max_ctx per sequence, but don't exceed memory budget.
+        // The .max(effective_max_ctx) was removed because it defeats the memory cap:
+        // when the GPU budget constraints max_tokens_by_mem below effective_max_ctx,
+        // forcing n_ctx back up to effective_max_ctx causes out-of-memory on UMA
+        // systems when the large virtual KV cache commits physical pages on demand.
         let n_ctx = (effective_max_ctx * n_seq)
             .min(max_tokens_by_mem)
-            .max(effective_max_ctx);
+            .max(n_seq);
         ctx_params.n_ctx = n_ctx;
         // n_batch must be at least as large as n_ctx to handle full prompts in one pass
         ctx_params.n_batch = effective_max_ctx.max(max_batch_size as u32);
@@ -365,6 +399,17 @@ impl LlamaCppModel {
         // across clone (e.g. future multi-backend); the unsafe impls guarantee thread safety.
         #[allow(clippy::arc_with_non_send_sync)]
         let ctx_arc = Arc::new(std::sync::Mutex::new(ctx));
+        // Detect whether the model's Jinja2 template handles the "tool" role.
+        let supports_tool_role = unsafe {
+            let p = ffi::llama_model_chat_template(model.as_ptr(), std::ptr::null());
+            if p.is_null() {
+                false
+            } else {
+                let tmpl = std::ffi::CStr::from_ptr(p).to_str().unwrap_or("");
+                tmpl.contains("tool") || tmpl.contains("tools")
+            }
+        };
+
         Ok(Self {
             _model: model,
             _ctx: ctx_arc,
@@ -373,6 +418,7 @@ impl LlamaCppModel {
             eos_token,
             effective_ctx: effective_max_ctx,
             owns_model: true,
+            supports_tool_role,
         })
     }
 
@@ -401,6 +447,7 @@ impl LlamaCppModel {
         let effective_max_ctx = resolve_context_len(max_context_len, model_train_ctx);
 
         let free_bytes = query_gpu_free_bytes()
+            .or_else(available_ram_bytes)
             .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
         let n_head_kv = self.config.num_heads_kv;
@@ -419,7 +466,7 @@ impl LlamaCppModel {
         };
         let n_ctx = (effective_max_ctx * n_seq)
             .min(max_tokens_by_mem)
-            .max(effective_max_ctx);
+            .max(n_seq);
 
         ctx_params.n_ctx = n_ctx;
         ctx_params.n_batch = effective_max_ctx.max(max_batch_size as u32);
@@ -443,6 +490,7 @@ impl LlamaCppModel {
             eos_token: self.eos_token,
             effective_ctx: effective_max_ctx,
             owns_model: false, // weights are owned by the original LlamaCppModel
+            supports_tool_role: self.supports_tool_role,
         })
     }
 }
@@ -574,6 +622,10 @@ impl Model for LlamaCppModel {
 
     fn get_embeddings(&self, tokens: &[i32]) -> Result<Vec<f32>> {
         self.do_get_embeddings(tokens)
+    }
+
+    fn template_supports_tool_role(&self) -> bool {
+        self.supports_tool_role
     }
 
     fn stop_tokens(&self) -> Vec<String> {

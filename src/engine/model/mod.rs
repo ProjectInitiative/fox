@@ -189,4 +189,11 @@ pub trait Model: Send + Sync {
     /// Used as base stop sequences so generation halts on model-native terminators
     /// even when the token ID is not caught by `is_eog_token`.
     fn stop_tokens(&self) -> Vec<String>;
+
+    /// Whether the model's chat template handles the "tool" role natively.
+    /// If false, Fox rewrites tool-result messages to "user" so the template
+    /// includes them instead of silently dropping them (e.g. Qwen 3.5/3.6).
+    fn template_supports_tool_role(&self) -> bool {
+        true
+    }
 }

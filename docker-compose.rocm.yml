@@ -1,0 +1,27 @@
+services:
+  fox:
+    image: fox:rocm
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+    ports:
+      - "8000:8080"
+    volumes:
+      - /mnt/pool/ai/huggingface/gguf-models:/root/.cache/ferrumox/models:ro
+    environment:
+      FOX_HOST: 0.0.0.0
+      FOX_PORT: "8080"
+      FOX_GPU_MEMORY_FRACTION: "0.95"
+      FOX_MAX_BATCH_SIZE: "16"
+      FOX_MAX_CONTEXT_LEN: "262144"
+
+      HSA_OVERRIDE_GFX_VERSION: "11.5.1"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    restart: unless-stopped

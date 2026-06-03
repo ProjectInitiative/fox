@@ -30,16 +30,20 @@ fn flatten_message_for_template(msg: &MessageForTemplate) -> (String, String) {
                 .iter()
                 .map(|tc| {
                     format!(
-                        "[tool_call: {}({})]",
+                        "{{\"name\": \"{}\", \"arguments\": {}}}",
                         tc.function.name, tc.function.arguments
                     )
                 })
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join("\n");
             let content = match &msg.content {
                 Some(c) if !c.is_empty() => format!("{c}\n{serialized}"),
                 _ => serialized,
             };
+            (msg.role.clone(), content)
+        }
+        "tool" => {
+            let content = msg.content.as_deref().unwrap_or("").to_string();
             (msg.role.clone(), content)
         }
         _ => {
@@ -241,62 +245,121 @@ pub fn try_parse_tool_call(
     known_tools: Option<&[Tool]>,
 ) -> (String, Option<Vec<ToolCall>>) {
     let trimmed = response.trim();
-    let value: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => return (response.to_string(), None),
-    };
 
-    // Pattern: {"name": "...", "arguments": {...}}
-    if let (Some(name), Some(args)) = (
-        value.get("name").and_then(|n| n.as_str()),
-        value.get("arguments"),
-    ) {
-        // Validate name against known tools when provided.
-        if let Some(tools) = known_tools {
-            if !tools.iter().any(|t| t.function.name == name) {
-                return (response.to_string(), None);
+    // Try to parse as a valid JSON object first (single tool call or tool_calls array).
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // Pattern: {"name": "...", "arguments": {...}}
+        if let (Some(name), Some(args)) = (
+            value.get("name").and_then(|n| n.as_str()),
+            value.get("arguments"),
+        ) {
+            if let Some(tools) = known_tools {
+                if !tools.iter().any(|t| t.function.name == name) {
+                    return (response.to_string(), None);
+                }
+            }
+            let call = ToolCall {
+                id: format!("call_{}", &Uuid::new_v4().to_string()[..8]),
+                call_type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: name.to_string(),
+                    arguments: args.to_string(),
+                },
+            };
+            return (String::new(), Some(vec![call]));
+        }
+
+        // Pattern: {"tool_calls": [...]}
+        if let Some(calls) = value.get("tool_calls").and_then(|tc| tc.as_array()) {
+            let tool_calls: Vec<ToolCall> = calls
+                .iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?.to_string();
+                    if let Some(tools) = known_tools {
+                        if !tools.iter().any(|t| t.function.name == name) {
+                            return None;
+                        }
+                    }
+                    let args = c.get("arguments")?.to_string();
+                    Some(ToolCall {
+                        id: format!("call_{}", &Uuid::new_v4().to_string()[..8]),
+                        call_type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name,
+                            arguments: args,
+                        },
+                    })
+                })
+                .collect();
+            if !tool_calls.is_empty() {
+                return (String::new(), Some(tool_calls));
             }
         }
-        let call = ToolCall {
-            id: format!("call_{}", &Uuid::new_v4().to_string()[..8]),
-            call_type: "function".to_string(),
-            function: ToolCallFunction {
-                name: name.to_string(),
-                arguments: args.to_string(),
-            },
-        };
-        return (String::new(), Some(vec![call]));
     }
 
-    // Pattern: {"tool_calls": [...]}
-    if let Some(calls) = value.get("tool_calls").and_then(|tc| tc.as_array()) {
-        let tool_calls: Vec<ToolCall> = calls
-            .iter()
-            .filter_map(|c| {
-                let name = c.get("name")?.as_str()?.to_string();
-                // Validate name if known_tools provided.
-                if let Some(tools) = known_tools {
-                    if !tools.iter().any(|t| t.function.name == name) {
-                        return None;
+    // Fallback: try splitting concatenated JSON objects.
+    // Some models (e.g. Qwen 3.6) emit multiple tool calls as adjacent objects:
+    //   {"name":"read",...}{"name":"glob",...}
+    let mut calls: Vec<ToolCall> = Vec::new();
+    let mut pos = 0;
+    let bytes = trimmed.as_bytes();
+    while pos < bytes.len() {
+        // Skip whitespace between objects.
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() || bytes[pos] != b'{' {
+            break;
+        }
+        let mut depth = 0i32;
+        let mut end = pos;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end += 1;
+                        break;
                     }
                 }
-                let args = c.get("arguments")?.to_string();
-                Some(ToolCall {
+                _ => {}
+            }
+            end += 1;
+        }
+        if depth != 0 {
+            break; // unmatched braces — stop
+        }
+        let chunk = &trimmed[pos..end];
+        pos = end;
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(chunk) {
+            if let (Some(name), Some(args)) = (
+                value.get("name").and_then(|n| n.as_str()),
+                value.get("arguments"),
+            ) {
+                if let Some(tools) = known_tools {
+                    if !tools.iter().any(|t| t.function.name == name) {
+                        continue;
+                    }
+                }
+                calls.push(ToolCall {
                     id: format!("call_{}", &Uuid::new_v4().to_string()[..8]),
                     call_type: "function".to_string(),
                     function: ToolCallFunction {
-                        name,
-                        arguments: args,
+                        name: name.to_string(),
+                        arguments: args.to_string(),
                     },
-                })
-            })
-            .collect();
-        if !tool_calls.is_empty() {
-            return (String::new(), Some(tool_calls));
+                });
+            }
         }
     }
 
-    (response.to_string(), None)
+    if !calls.is_empty() {
+        (String::new(), Some(calls))
+    } else {
+        (response.to_string(), None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +459,17 @@ pub fn prepare_prompt(
                     tool_call_id: None,
                 },
             );
+        }
+    }
+
+    // Rewrite "tool" role messages to "user" for models whose chat template
+    // doesn't handle the tool role (e.g. Qwen 3.5/3.6).  Otherwise the template
+    // silently drops the tool result from the prompt.
+    if !entry.engine.template_supports_tool_role() {
+        for msg in &mut messages {
+            if msg.role == "tool" {
+                msg.role = "user".to_string();
+            }
         }
     }
 

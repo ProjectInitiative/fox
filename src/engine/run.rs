@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 
@@ -15,6 +16,14 @@ impl InferenceEngine {
         // We increment the Prometheus IntCounters by the step delta each loop iteration.
         let mut last_prefix_hits: u64 = 0;
         let mut last_prefix_misses: u64 = 0;
+
+        // Periodic stats (windowed — resets each interval)
+        let mut stats_tokens_prefill: u64 = 0;
+        let mut stats_tokens_decode: u64 = 0;
+        let mut stats_time_prefill: f64 = 0.0;
+        let mut stats_window_start = Instant::now();
+        let mut stats_step_count: u64 = 0;
+        let stats_interval: u64 = 10; // log every 10 steps
 
         loop {
             let batch = engine.scheduler.schedule_step();
@@ -55,8 +64,15 @@ impl InferenceEngine {
             let decode_ids = batch.decode.clone();
 
             if !prefill_ids.is_empty() {
+                // Count actual prompt tokens being prefilled (minus prefix-cached tokens)
+                let prompts = engine.scheduler.get_running(&prefill_ids);
+                for p in &prompts {
+                    stats_tokens_prefill += (p.prompt_tokens.len() - p.skip_prefix_tokens) as u64;
+                }
+                let prefill_start = Instant::now();
                 match engine.run_prefill(&prefill_ids).await {
                     Ok(prefill_results) => {
+                        stats_time_prefill += prefill_start.elapsed().as_secs_f64();
                         engine.handle_logits(&prefill_results, true).await?;
                     }
                     Err(e) => {
@@ -75,6 +91,7 @@ impl InferenceEngine {
             if !decode_ids.is_empty() {
                 match engine.run_decode(&decode_ids).await {
                     Ok(decode_results) => {
+                        stats_tokens_decode += decode_results.len() as u64;
                         engine.handle_logits(&decode_results, false).await?;
                     }
                     Err(e) => {
@@ -90,6 +107,55 @@ impl InferenceEngine {
                         }
                     }
                 }
+            }
+
+            // Periodic stats (windowed — resets each interval)
+            stats_step_count += 1;
+            if stats_step_count % stats_interval == 0 {
+                let elapsed = stats_window_start.elapsed();
+                let total = stats_tokens_prefill + stats_tokens_decode;
+                let throughput = if elapsed.as_secs_f64() > 0.0 {
+                    total as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let running = engine.scheduler.active_requests();
+                let waiting = engine.scheduler.queue_depth();
+                let kv_usage = engine.kv_cache.memory_usage();
+                let hits = engine
+                    .scheduler
+                    .prefix_hits
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let misses = engine
+                    .scheduler
+                    .prefix_misses
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let prefix_ratio = if hits + misses > 0 {
+                    hits as f64 / (hits + misses) as f64
+                } else {
+                    0.0
+                };
+                let pp_s = if stats_time_prefill > 0.0 {
+                    stats_tokens_prefill as f64 / stats_time_prefill
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    "stats: req={}(+{}w) kv={:.1}% pp={}({:.0}t/s) tg={} throughput={:.1}tok/s prefix_hit={:.1}%",
+                    running,
+                    waiting,
+                    kv_usage * 100.0,
+                    stats_tokens_prefill,
+                    pp_s,
+                    stats_tokens_decode,
+                    throughput,
+                    prefix_ratio * 100.0,
+                );
+                // Reset window counters so each interval shows current rate.
+                stats_tokens_prefill = 0;
+                stats_tokens_decode = 0;
+                stats_time_prefill = 0.0;
+                stats_window_start = Instant::now();
             }
         }
     }
