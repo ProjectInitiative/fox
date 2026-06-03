@@ -361,6 +361,8 @@ impl LlamaCppModel {
         // Query FREE memory now (after model weights are loaded) so we don't OOM.
         // Tries nvidia-smi, then rocm-smi, then system RAM (for HIP UMA / CPU).
         let free_bytes = query_gpu_free_bytes()
+            .filter(|&b| b >= 1024 * 1024 * 1024) // ignore bogus sub-1 GiB readings
+            .or_else(available_ram_bytes)
             .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
         // bytes_per_token = 2 (K+V) * n_head_kv * head_dim * 2 (fp16) * n_layer
@@ -446,6 +448,8 @@ impl LlamaCppModel {
         let effective_max_ctx = resolve_context_len(max_context_len, model_train_ctx);
 
         let free_bytes = query_gpu_free_bytes()
+            .filter(|&b| b >= 1024 * 1024 * 1024)
+            .or_else(available_ram_bytes)
             .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
         let n_head_kv = self.config.num_heads_kv;
