@@ -115,116 +115,89 @@ pub async fn chat_completions(
 
     if req.stream {
         if has_tools {
-            // With tools: buffer all tokens, parse tool call, emit as SSE deltas.
-            let (full_content, completion_tokens, stop_reason) = buffer_tokens(&mut rx).await;
+            // With tools: stream tokens incrementally, then detect tool calls at the end.
+            let owned_tools = tc.tools.clone();
+            let log_model = req.model.clone();
+            let log_prompt = prompt_tokens_len;
 
-            let (content, mut tool_calls) = try_parse_tool_call(&full_content, eff_tools);
-
-            // Enforce parallel_tool_calls: false
-            if !allow_parallel {
-                if let Some(ref mut calls) = tool_calls {
-                    calls.truncate(1);
-                }
-            }
-
-            let finish_reason = if tool_calls.is_some() {
-                "tool_calls".to_string()
-            } else {
-                stop_reason
-                    .as_ref()
-                    .map(finish_reason_str)
-                    .unwrap_or("stop")
-                    .to_string()
-            };
-
-            tracing::info!(
-                model = %req.model,
-                stream = true,
-                prompt_tokens = prompt_tokens_len as u32,
-                completion_tokens,
-                duration_ms = start.elapsed().as_millis() as u64,
-                finish_reason = %finish_reason,
-                "done"
-            );
-
-            let usage = Usage {
-                prompt_tokens: prompt_tokens_len as u32,
-                completion_tokens,
-                total_tokens: prompt_tokens_len as u32 + completion_tokens,
-            };
-
-            let id_c = id.clone();
-            let model_c = req.model.clone();
-            let finish_c = finish_reason.clone();
             let stream = async_stream::stream! {
-                // Chunk 1: role announcement
-                let first = ChatCompletionChunk {
-                    id: id_c.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model_c.clone(),
-                    choices: vec![ChatCompletionChunkChoice {
-                        index: 0,
-                        delta: ChatMessageDelta {
-                            role: Some("assistant".to_string()),
-                            content: None,
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                    system_fingerprint: None,
-                };
-                yield Ok::<_, std::convert::Infallible>(
-                    Event::default().json_data(first).unwrap_or_else(|_| Event::default().data(""))
-                );
-                tokio::task::yield_now().await;
+                let mut completion_tokens: u32 = 0;
+                let mut first_chunk = true;
+                let mut full_text = String::new();
+                while let Some(token) = rx.recv().await {
+                    let is_done = token.stop_reason.is_some();
+                    let finish_reason = token.stop_reason.as_ref().map(finish_reason_str).map(str::to_string);
+                    completion_tokens += 1;
+                    full_text.push_str(&token.text);
 
-                // Chunk 2: tool_calls delta or content + usage
-                let delta = if let Some(ref tcs) = tool_calls {
-                    ChatMessageDelta {
-                        role: None,
-                        content: None,
-                        tool_calls: Some(
-                            tcs.iter()
-                                .enumerate()
-                                .map(|(i, tc)| ToolCallDelta {
-                                    index: i as u32,
-                                    id: Some(tc.id.clone()),
-                                    call_type: Some("function".to_string()),
-                                    function: ToolCallFunctionDelta {
-                                        name: Some(tc.function.name.clone()),
-                                        arguments: Some(tc.function.arguments.clone()),
-                                    },
-                                })
-                                .collect(),
-                        ),
+                    if is_done {
+                        tracing::info!(
+                            model = %log_model,
+                            stream = true,
+                            prompt_tokens = log_prompt,
+                            completion_tokens,
+                            duration_ms = start.elapsed().as_millis() as u64,
+                            finish_reason = %finish_reason.as_deref().unwrap_or("stop"),
+                            "done"
+                        );
                     }
-                } else {
-                    ChatMessageDelta {
-                        role: None,
-                        content: Some(content),
-                        tool_calls: None,
+
+                    // Detect tool calls from the accumulated full text when generation ends.
+                    let actual_finish_reason = if is_done {
+                        let (_, tool_calls) = try_parse_tool_call(&full_text, owned_tools.as_deref());
+                        if tool_calls.is_some() {
+                            Some("tool_calls".to_string())
+                        } else {
+                            finish_reason.clone()
+                        }
+                    } else {
+                        None
+                    };
+
+                    let usage = if is_done {
+                        Some(Usage {
+                            prompt_tokens: log_prompt as u32,
+                            completion_tokens,
+                            total_tokens: log_prompt as u32 + completion_tokens,
+                        })
+                    } else {
+                        None
+                    };
+
+                    // First chunk carries role; subsequent chunks carry content.
+                    let (role, content) = if first_chunk {
+                        first_chunk = false;
+                        (Some("assistant".to_string()), Some(token.text.clone()))
+                    } else {
+                        (None, Some(token.text.clone()))
+                    };
+
+                    let chunk = ChatCompletionChunk {
+                        id: id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: req.model.clone(),
+                        choices: vec![ChatCompletionChunkChoice {
+                            index: 0,
+                            delta: ChatMessageDelta {
+                                role,
+                                content,
+                                tool_calls: None,
+                            },
+                            finish_reason: actual_finish_reason,
+                        }],
+                        usage,
+                        system_fingerprint: None,
+                    };
+                    let event = Event::default()
+                        .json_data(chunk)
+                        .unwrap_or_else(|_| Event::default().data(""));
+                    tokio::task::yield_now().await;
+                    yield Ok::<_, std::convert::Infallible>(event);
+                    if is_done {
+                        break;
                     }
-                };
-
-                let final_chunk = ChatCompletionChunk {
-                    id: id_c,
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model_c,
-                    choices: vec![ChatCompletionChunkChoice {
-                        index: 0,
-                        delta,
-                        finish_reason: Some(finish_c),
-                    }],
-                    usage: Some(usage),
-                    system_fingerprint: None,
-                };
-                yield Ok::<_, std::convert::Infallible>(
-                    Event::default().json_data(final_chunk).unwrap_or_else(|_| Event::default().data(""))
-                );
-
+                }
                 // OpenAI-compatible stream terminator
                 yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
             };
