@@ -360,13 +360,19 @@ impl LlamaCppModel {
         // Cap total KV context to fit in available GPU (or RAM) memory.
         // Query FREE memory now (after model weights are loaded) so we don't OOM.
         // Tries nvidia-smi, then rocm-smi, then system RAM (for HIP UMA / CPU).
-        let free_bytes = query_gpu_free_bytes()
-            .filter(|&b| b >= 1024 * 1024 * 1024) // ignore bogus sub-1 GiB readings
-            .or_else(available_ram_bytes)
-            .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize);
+        // When FOX_GPU_MEMORY_BYTES is set, use it directly (Docker override).
+        let free_bytes = if std::env::var("FOX_GPU_MEMORY_BYTES").is_ok() {
+            (gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize
+        } else {
+            query_gpu_free_bytes()
+                .filter(|&b| b >= 1024 * 1024 * 1024)
+                .or_else(available_ram_bytes)
+                .unwrap_or((gpu_memory_bytes as f64 * gpu_memory_fraction as f64) as usize)
+        };
         let budget_bytes = (free_bytes as f64 * gpu_memory_fraction as f64) as usize;
         tracing::info!(
-            "memory budget: free={:.1} GiB, fraction={}, budget={:.1} GiB",
+            "memory budget: gpu={:.1} GiB, free={:.1} GiB, fraction={}, budget={:.1} GiB",
+            gpu_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             gpu_memory_fraction,
             budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
